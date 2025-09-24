@@ -36,11 +36,6 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
   List<int> _recvBuffer = [];
   int _expectedLength = -1;
 
-  String _deviceVersion = '';
-
-  StreamSubscription? _msgSub;
-  StreamSubscription? _connSub;
-
   // user input
   int _age = 30;
   double _weightKg = 70;
@@ -75,55 +70,21 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
     }
   }
 
-  void _setupListeners() {
-    _msgSub = _serial
-        .getSerialMessageListener()
-        .receiveBroadcastStream()
-        .listen((data) {
-          if (data is List<int>) _handle(Uint8List.fromList(data));
-        });
-
-    _connSub = _serial
-        .getDeviceConnectionListener()
-        .receiveBroadcastStream()
-        .listen((s) {
-          if (s == false) setState(() => _connected = false);
-        });
-  }
+  void _setupListeners() {}
 
   void _send(List<int> cmd, String desc) async {
     final sent = await _serial.write(Uint8List.fromList(cmd));
-    if (sent)
+    if (sent) {
       _addLog(
         "Sent $desc: ${cmd.map((e) => e.toRadixString(16).padLeft(2, '0')).join(' ')}",
       );
+    }
   }
 
   void _addLog(String m) {
     setState(() => _log += "$m\n");
     print(m);
   }
-
-  // void _handle(Uint8List data) {
-  //   _addLog(
-  //     "Raw: ${data.map((b) => b.toRadixString(16).padLeft(2, "0")).join(" ")}",
-  //   );
-
-  //   if (data.isEmpty || data[0] != 0xAA) return;
-  //   final cmd = data[2];
-
-  //   switch (cmd) {
-  //     case 0xB1:
-  //       if (data.length >= 12) _parseImpedance(data);
-  //       break;
-  //     case 0xD2:
-  //       _parseD2(data); // inside we’ll check lengths carefully
-  //       break;
-  //     case 0xE0:
-  //       // version info
-  //       break;
-  //   }
-  // }
 
   void _handle(Uint8List data) {
     // Append new data
@@ -187,9 +148,7 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
 
     final versionStr = "$appName v$major.$minor";
 
-    setState(() {
-      _deviceVersion = versionStr;
-    });
+    setState(() {});
 
     _addLog("Device version: $versionStr");
   }
@@ -247,30 +206,6 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
     payload.add(lrc);
     _send(payload, "D2 Algorithm input");
   }
-
-  // void _parseD2(Uint8List d) {
-  //   if (d.length < 10) {
-  //     _addLog("D2 packet too short: ${d.length} bytes");
-  //     return;
-  //   }
-  //   Map<String, dynamic> r = {};
-  //   int u16(int i) => (i + 1 < d.length) ? (d[i] | (d[i + 1] << 8)) : 0;
-  //   int u8(int i) => (i < d.length) ? d[i] : 0;
-
-  //   if (d.length >= 9) r["Fat mass (kg)"] = u16(5) / 10.0;
-  //   if (d.length >= 11) r["Fat %"] = u16(7) / 10.0;
-  //   if (d.length >= 18) r["BMI"] = u16(16) / 10.0;
-  //   if (d.length >= 24) r["BMR"] = u16(22);
-  //   if (d.length >= 29) r["Lean mass (kg)"] = u16(27) / 10.0;
-  //   if (d.length >= 39) r["Bone mass (kg)"] = u8(38) / 10.0;
-  //   if (d.length >= 45) r["Moisture %"] = u16(43) / 10.0;
-  //   if (d.length >= 50) r["Visceral fat"] = u8(49);
-  //   if (d.length >= 54) r["Skeletal muscle (kg)"] = u16(52) / 10.0;
-  //   if (d.length >= 59) r["Protein %"] = u16(57) / 10.0;
-
-  //   setState(() => _results = r);
-  //   _addLog("Parsed D2 results (partial): $r");
-  // }
 
   void _parseD2(Uint8List d) {
     if (d.length < 10) {
