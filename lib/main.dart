@@ -48,6 +48,10 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
   double? _impedance;
   Map<String, dynamic> _results = {};
 
+  int _impedanceRetries = 0;
+  int _currentMode = 0x03; // default TwoArms
+  bool _autoSwitchTried = false;
+
   @override
   void initState() {
     super.initState();
@@ -232,10 +236,11 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
     final result = d[3];
     switch (result) {
       case 0x00:
-        _addLog("Mode switch OK");
-        // Now query impedance after successful switch
-        Future.delayed(const Duration(milliseconds: 300), () {
-          _send([0x55, 0x05, 0xB1, 0x51, 0xA4], "Query 50kHz impedance");
+        _addLog("Mode switch OK (mode=0x${_currentMode.toRadixString(16)})");
+        // Increased delay before querying impedance
+        Future.delayed(const Duration(milliseconds: 1000), () {
+          _impedanceRetries = 0;
+          _queryImpedance();
         });
         break;
       case 0x01:
@@ -249,6 +254,10 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
     }
   }
 
+  void _queryImpedance() {
+    _send([0x55, 0x05, 0xB1, 0x51, 0xA4], "Query 50kHz impedance");
+  }
+
   void _parseImpedance(Uint8List d) {
     if (d.length < 13) {
       _addLog("Impedance packet too short: ${d.length} bytes");
@@ -257,38 +266,10 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
 
     final frequency = d[3];
     final state = d[4];
-    final dataType = d[5];
-
-    String freqStr;
-    switch (frequency) {
-      case 0x01:
-        freqStr = "5kHz";
-        break;
-      case 0x02:
-        freqStr = "10kHz";
-        break;
-      case 0x03:
-        freqStr = "20kHz";
-        break;
-      case 0x04:
-        freqStr = "25kHz";
-        break;
-      case 0x05:
-        freqStr = "50kHz";
-        break;
-      case 0x06:
-        freqStr = "100kHz";
-        break;
-      default:
-        freqStr = "Unknown";
-    }
 
     if (state != 0x03) {
       String stateStr;
       switch (state) {
-        case 0x00:
-          stateStr = "NULL";
-          break;
         case 0x01:
           stateStr = "Checking electrode";
           break;
@@ -307,27 +288,131 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
         default:
           stateStr = "Unknown ($state)";
       }
+
       _addLog("Impedance state: $stateStr");
+
+      // Automatic retry logic
+      if (state == 0x01 && _impedanceRetries < 3) {
+        _impedanceRetries++;
+        _addLog("Retrying impedance (#$_impedanceRetries) in 1s...");
+        Future.delayed(const Duration(seconds: 1), _queryImpedance);
+        return;
+      }
+
+      // After retries, try switching to other mode
+      if (state == 0x01 && !_autoSwitchTried) {
+        _autoSwitchTried = true;
+        _addLog("Switching to FourElectrode mode (0x02)...");
+        _switchMode(0x02);
+        return;
+      }
+
       return;
     }
 
-    // FIXED: Correct byte order (little-endian) and indices
-    // For four-electrode mode: bytes 8-11 contain uint32_t impedance with 1Ω resolution
+    // Parsing impedance value (bytes 8–11)
     final imp = d[8] | (d[9] << 8) | (d[10] << 16) | (d[11] << 24);
-
     if (imp > 0 && imp < 1200) {
-      // Valid range check
       setState(() => _impedance = imp.toDouble());
-      _addLog("Two-arms impedance ($freqStr): $_impedance Ω");
+      _addLog("Two-arms impedance (50kHz): $_impedance Ω");
     } else {
       _addLog("Invalid impedance value: $imp Ω");
     }
   }
 
+  void _switchMode(int mode) {
+    _currentMode = mode;
+    _impedanceRetries = 0;
+    int sum = (0x55 + 0x06 + 0xB0 + mode + 0x05) & 0xFF;
+    int chk = ((~sum) + 1) & 0xFF;
+    _send([
+      0x55,
+      0x06,
+      0xB0,
+      mode,
+      0x05,
+      chk,
+    ], "Switch to mode=0x${mode.toRadixString(16)} 50kHz");
+  }
+
+  // void _startImpedance() {
+  //   _addLog("==== Starting impedance measurement ====");
+  //   // Switch to TwoArms (0x03) mode, 50kHz (0x05)
+  //   // _send([0x55, 0x06, 0xB0, 0x03, 0x05, 0xED], "Switch to TwoArms 50kHz mode");
+  //   _send([
+  //     0x55,
+  //     0x06,
+  //     0xB0,
+  //     0x02,
+  //     0x05,
+  //     0xEE,
+  //   ], "Switch to FourElectrode 50kHz mode");
+  // }
   void _startImpedance() {
     _addLog("==== Starting impedance measurement ====");
-    // Switch to TwoArms (0x03) mode, 50kHz (0x05)
-    _send([0x55, 0x06, 0xB0, 0x03, 0x05, 0xED], "Switch to TwoArms 50kHz mode");
+    _autoSwitchTried = false;
+    _switchMode(0x03); // start with TwoArms
+  }
+
+  Future<void> _sendSelfTest() async {
+    final List<Map<String, List<int>>> tests = [
+      {
+        "Master self-test": [0x55, 0x05, 0xB3, 0x00, 0xF3],
+      },
+      {
+        "BIA self-test": [0x55, 0x05, 0xB3, 0x01, 0xF2],
+      },
+      {
+        "Weight self-test": [0x55, 0x05, 0xB3, 0x02, 0xF1],
+      },
+    ];
+
+    bool gotResponse = false;
+
+    for (final test in tests) {
+      final desc = test.keys.first;
+      final cmd = test.values.first;
+
+      _addLog("Sending $desc...");
+      final sent = await _serial.write(Uint8List.fromList(cmd));
+      if (sent) {
+        _addLog(
+          "Sent $desc: ${cmd.map((e) => e.toRadixString(16).padLeft(2, '0')).join(' ').toUpperCase()}",
+        );
+      } else {
+        _addLog("Failed to send $desc");
+      }
+
+      // Wait up to 1 second for any response
+      final completer = Completer<void>();
+      late StreamSubscription sub;
+      sub = _serial.getSerialMessageListener().receiveBroadcastStream().listen((
+        data,
+      ) {
+        if (data is Uint8List && data.isNotEmpty && data[2] == 0xB3) {
+          gotResponse = true;
+          _addLog(
+            "Self-test response received: ${data.map((e) => e.toRadixString(16).padLeft(2, '0')).join(' ').toUpperCase()}",
+          );
+          sub.cancel();
+          completer.complete();
+        }
+      });
+
+      await Future.any([
+        completer.future,
+        Future.delayed(const Duration(seconds: 2)),
+      ]);
+      await sub.cancel();
+    }
+
+    if (!gotResponse) {
+      _addLog(
+        "⚠️ No B3 responses detected. This firmware (Master v1.5) likely does not support self-test command.",
+      );
+    } else {
+      _addLog("✅ Self-test command supported and responded successfully.");
+    }
   }
 
   void _calculate() {
@@ -703,6 +788,15 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
                     ),
                     const SizedBox(height: 12),
                     ElevatedButton.icon(
+                      onPressed: _connected ? _sendSelfTest : null,
+                      icon: const Icon(Icons.settings),
+                      label: const Text("Run Self-Test"),
+                      style: ElevatedButton.styleFrom(
+                        minimumSize: const Size(double.infinity, 48),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    ElevatedButton.icon(
                       onPressed: _connected ? _startImpedance : null,
                       icon: const Icon(Icons.electric_bolt),
                       label: const Text("Measure Impedance"),
@@ -765,35 +859,103 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
                         ),
                       ),
                       const Divider(),
-                      ..._results.entries.map(
-                        (e) => Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 4),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Expanded(
-                                child: Text(
+                      // 2 columns grid layout
+                      GridView.count(
+                        crossAxisCount: 2,
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        childAspectRatio:
+                            9.8, // Adjust spacing (higher = flatter)
+                        mainAxisSpacing: 6,
+                        crossAxisSpacing: 10,
+                        children: _results.entries.map((e) {
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.grey[50],
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(color: Colors.grey.shade300),
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
                                   e.key,
-                                  style: const TextStyle(fontSize: 14),
+                                  style: const TextStyle(
+                                    fontSize: 13,
+                                    color: Colors.black87,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                 ),
-                              ),
-                              Text(
-                                e.value is double
-                                    ? (e.value as double).toStringAsFixed(1)
-                                    : e.value.toString(),
-                                style: const TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.bold,
+                                const SizedBox(height: 2),
+                                Text(
+                                  e.value is double
+                                      ? (e.value as double).toStringAsFixed(1)
+                                      : e.value.toString(),
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.blueAccent,
+                                  ),
                                 ),
-                              ),
-                            ],
-                          ),
-                        ),
+                              ],
+                            ),
+                          );
+                        }).toList(),
                       ),
                     ],
                   ),
                 ),
               ),
+
+            // Card(
+            //   child: Padding(
+            //     padding: const EdgeInsets.all(12),
+            //     child: Column(
+            //       crossAxisAlignment: CrossAxisAlignment.start,
+            //       children: [
+            //         const Text(
+            //           "Body Composition Results",
+            //           style: TextStyle(
+            //             fontSize: 18,
+            //             fontWeight: FontWeight.bold,
+            //           ),
+            //         ),
+            //         const Divider(),
+            //         ..._results.entries.map(
+            //           (e) => Padding(
+            //             padding: const EdgeInsets.symmetric(vertical: 4),
+            //             child: Row(
+            //               mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            //               children: [
+            //                 Expanded(
+            //                   child: Text(
+            //                     e.key,
+            //                     style: const TextStyle(fontSize: 14),
+            //                   ),
+            //                 ),
+            //                 Text(
+            //                   e.value is double
+            //                       ? (e.value as double).toStringAsFixed(1)
+            //                       : e.value.toString(),
+            //                   style: const TextStyle(
+            //                     fontSize: 14,
+            //                     fontWeight: FontWeight.bold,
+            //                   ),
+            //                 ),
+            //               ],
+            //             ),
+            //           ),
+            //         ),
+            //       ],
+            //     ),
+            //   ),
+            // ),
             const SizedBox(height: 12),
 
             // Log section
