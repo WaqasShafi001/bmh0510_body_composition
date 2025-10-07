@@ -869,6 +869,7 @@ class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
                         mainAxisSpacing: 6,
                         crossAxisSpacing: 10,
                         children: _results.entries.map((e) {
+                          _addLog("Result: ${e.key} = ${e.value}");
                           return Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 8,
