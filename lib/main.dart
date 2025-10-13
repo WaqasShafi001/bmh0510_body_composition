@@ -23,6 +23,9 @@ class MyApp extends StatelessWidget {
 // Reference: BMH05108 protocol document v1.3 (page 20-26
 
 // 50kHz TwoArms mode)
+// FIXED: Corrected checksum calculation in _calculate()
+// FIXED: Corrected byte indices in _parseD2()
+// FIXED: Added delay after mode switch before querying impedance
 
 class BodyCompositionScreen extends StatefulWidget {
   const BodyCompositionScreen({super.key});
