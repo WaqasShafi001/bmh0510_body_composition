@@ -26,7 +26,6 @@ class MyApp extends StatelessWidget {
 // FIXED: Corrected checksum calculation in _calculate()
 // FIXED: Corrected byte indices in _parseD2()
 // FIXED: Added delay after mode switch before querying impedance
-// Date: 2025-10-05
 
 class BodyCompositionScreen extends StatefulWidget {
   const BodyCompositionScreen({super.key});
