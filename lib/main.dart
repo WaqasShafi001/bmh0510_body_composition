@@ -1,792 +1,1014 @@
+import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_serial_communication/flutter_serial_communication.dart';
 import 'package:flutter_serial_communication/models/device_info.dart';
-import 'dart:typed_data';
-import 'dart:async';
 
-void main() {
-  runApp(MyApp());
-}
+void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BMH05108 Arms Body Composition Monitor',
-      theme: ThemeData(
-        primarySwatch: Colors.blue,
-        visualDensity: VisualDensity.adaptivePlatformDensity,
-      ),
-      home: BMH05108Screen(),
+      title: 'BMH05108 Body Composition',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const BodyCompositionScreen(),
     );
   }
 }
 
-class BMH05108Screen extends StatefulWidget {
-  const BMH05108Screen({super.key});
+// working code of body composition using BMH05108 (Master v1.5 firmware)
+// Reference: BMH05108 protocol document v1.3 (page 20-26
+
+// 50kHz TwoArms mode)
+// FIXED: Corrected checksum calculation in _calculate()
+// FIXED: Corrected byte indices in _parseD2()
+// FIXED: Added delay after mode switch before querying impedance
+
+class BodyCompositionScreen extends StatefulWidget {
+  const BodyCompositionScreen({super.key});
 
   @override
-  BMH05108ScreenState createState() => BMH05108ScreenState();
+  State<BodyCompositionScreen> createState() => _BodyCompositionScreenState();
 }
 
-class BMH05108ScreenState extends State<BMH05108Screen> {
-  final FlutterSerialCommunication _serialCommunication =
-      FlutterSerialCommunication();
-  List<DeviceInfo> _availableDevices = [];
-  DeviceInfo? _selectedDevice;
-  bool _isConnected = false;
-  String _log = '';
-  Timer? _measurementTimer;
-  StreamSubscription<dynamic>? _messageSubscription;
-  StreamSubscription<dynamic>? _connectionSubscription;
+class _BodyCompositionScreenState extends State<BodyCompositionScreen> {
+  final FlutterSerialCommunication _serial = FlutterSerialCommunication();
+  List<DeviceInfo> _devices = [];
+  DeviceInfo? _selected;
+  bool _connected = false;
+  String _log = "";
 
-  // Arms impedance data
-  final Map<String, double> _impedanceData = {
-    'rightHand20kHz': 0.0,
-    'leftHand20kHz': 0.0,
-    'rightHand100kHz': 0.0,
-    'leftHand100kHz': 0.0,
-  };
+  final List<int> _recvBuffer = [];
+  int _expectedLength = -1;
 
-  String _impedanceStatus = 'Not Ready';
-  bool _isMeasuring = false;
-  String _deviceVersion = 'Unknown';
+  StreamSubscription? _serialSubscription;
+
+  // user input
+  int _age = 30;
+  double _weightKg = 70;
+  int _heightFeet = 5;
+  int _heightInch = 7;
+  int _sex = 1; // 1=male, 0=female
+
+  double? _impedance;
+  Map<String, dynamic> _results = {};
+
+  int _impedanceRetries = 0;
+  int _currentMode = 0x03; // default TwoArms
+  bool _autoSwitchTried = false;
 
   @override
   void initState() {
     super.initState();
-    _scanForDevices();
+    _scan();
   }
 
   @override
   void dispose() {
-    _measurementTimer?.cancel();
-    _messageSubscription?.cancel();
-    _connectionSubscription?.cancel();
-    _disconnectDevice();
+    _serialSubscription?.cancel();
+    _serial.disconnect();
     super.dispose();
   }
 
-  Future<void> _scanForDevices() async {
-    try {
-      List<DeviceInfo> devices = await _serialCommunication
-          .getAvailableDevices();
-      setState(() {
-        _availableDevices = devices;
-      });
-      _addLog('Found ${devices.length} devices');
-      for (var device in devices) {
-        _addLog('Device: ${device.deviceName} (${device.manufacturerName})');
-      }
-    } catch (e) {
-      _addLog('Error scanning devices: $e');
-    }
+  Future<void> _scan() async {
+    final d = await _serial.getAvailableDevices();
+    setState(() => _devices = d);
+    _addLog("Found ${d.length} devices");
   }
 
-  Future<void> _connectToDevice() async {
-    if (_selectedDevice == null) {
-      _addLog('Please select a device first');
-      return;
-    }
-
-    try {
-      bool connected = await _serialCommunication.connect(
-        _selectedDevice!,
-        38400,
-      );
-
-      if (connected) {
-        setState(() {
-          _isConnected = true;
-        });
-
-        _addLog('Connected to ${_selectedDevice!.deviceName}');
-
-        // Setup listeners
-        _setupListeners();
-
-        // Get device version
-        await Future.delayed(Duration(milliseconds: 500));
-        _getDeviceVersion();
-      } else {
-        _addLog('Failed to connect to device');
-      }
-    } catch (e) {
-      _addLog('Connection error: $e');
+  Future<void> _connect() async {
+    if (_selected == null) return;
+    bool ok = await _serial.connect(_selected!, 38400);
+    if (ok) {
+      setState(() => _connected = true);
+      _setupListeners();
+      _addLog("Connected to ${_selected!.deviceName}");
+      await Future.delayed(const Duration(milliseconds: 200));
+      _send([0x55, 0x05, 0xE0, 0x00, 0xC6], "Get Version");
+    } else {
+      _addLog("Failed to connect");
     }
   }
 
   void _setupListeners() {
-    // Listen for incoming serial data
-    _messageSubscription = _serialCommunication
+    // FIXED: EventChannel requires receiveBroadcastStream() before listen()
+    _serialSubscription = _serial
         .getSerialMessageListener()
         .receiveBroadcastStream()
         .listen(
           (data) {
-            if (data is List<int>) {
-              _handleReceivedData(Uint8List.fromList(data));
+            if (data is Uint8List) {
+              _handle(data);
+            } else if (data is List<int>) {
+              _handle(Uint8List.fromList(data));
+            } else {
+              _addLog("Unexpected data type: ${data.runtimeType}");
             }
           },
           onError: (error) {
-            _addLog('Message listener error: $error');
+            _addLog("Serial error: $error");
           },
-        );
-
-    // Listen for connection status changes
-    _connectionSubscription = _serialCommunication
-        .getDeviceConnectionListener()
-        .receiveBroadcastStream()
-        .listen(
-          (connectionStatus) {
-            _addLog('Connection status: $connectionStatus');
-            if (connectionStatus == false || connectionStatus == 'false') {
-              setState(() {
-                _isConnected = false;
-                _isMeasuring = false;
-              });
-              _measurementTimer?.cancel();
-            }
-          },
-          onError: (error) {
-            _addLog('Connection listener error: $error');
-          },
+          cancelOnError: false,
         );
   }
 
-  Future<void> _disconnectDevice() async {
-    try {
-      _measurementTimer?.cancel();
-      _messageSubscription?.cancel();
-      _connectionSubscription?.cancel();
-
-      await _serialCommunication.disconnect();
-
-      setState(() {
-        _isConnected = false;
-        _selectedDevice = null;
-        _isMeasuring = false;
-      });
-      _addLog('Disconnected from device');
-    } catch (e) {
-      _addLog('Disconnect error: $e');
+  void _send(List<int> cmd, String desc) async {
+    final sent = await _serial.write(Uint8List.fromList(cmd));
+    if (sent) {
+      _addLog(
+        "Sent $desc: ${cmd.map((e) => e.toRadixString(16).toUpperCase().padLeft(2, '0')).join(' ')}",
+      );
+    } else {
+      _addLog("Failed to send $desc");
     }
   }
 
-  void _handleReceivedData(Uint8List data) {
+  void _addLog(String m) {
+    setState(() {
+      _log += "$m\n";
+      // Keep log manageable
+      final lines = _log.split('\n');
+      if (lines.length > 100) {
+        _log = lines.sublist(lines.length - 100).join('\n');
+      }
+    });
+    print(m);
+  }
+
+  void _handle(Uint8List data) {
     _addLog(
-      'Raw data: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}',
+      "Received ${data.length} bytes: ${data.map((e) => e.toRadixString(16).toUpperCase().padLeft(2, '0')).join(' ')}",
     );
 
-    if (data.length < 3) return;
+    // Append new data
+    _recvBuffer.addAll(data);
 
-    // Check frame header and command
-    if (data[0] == 0xAA) {
-      // Response from device
-      int command = data[2];
+    // Process all complete packets in buffer
+    while (_recvBuffer.isNotEmpty) {
+      // Look for frame header
+      if (_recvBuffer[0] != 0xAA) {
+        _addLog("Invalid frame header: 0x${_recvBuffer[0].toRadixString(16)}");
+        _recvBuffer.removeAt(0);
+        continue;
+      }
 
-      switch (command) {
-        case 0xB0: // Impedance mode switch response
-          _parseImpedanceModeResponse(data);
+      // Need at least 2 bytes to read length
+      if (_recvBuffer.length < 2) break;
+
+      final frameLength = _recvBuffer[1];
+
+      // Wait for complete frame
+      if (_recvBuffer.length < frameLength) break;
+
+      // Extract complete packet
+      final packet = Uint8List.fromList(_recvBuffer.sublist(0, frameLength));
+
+      // Verify checksum
+      if (!_verifyChecksum(packet)) {
+        _addLog("Checksum failed for packet");
+        _recvBuffer.removeRange(0, frameLength);
+        continue;
+      }
+
+      // Remove processed bytes
+      _recvBuffer.removeRange(0, frameLength);
+
+      // Process packet
+      final cmd = packet[2];
+      switch (cmd) {
+        case 0xE0:
+          _parseVersion(packet);
           break;
-        case 0xB1: // Impedance status response
-          _parseImpedanceStatus(data);
+        case 0xB0:
+          _parseModeSwitch(packet);
           break;
-        case 0xE0: // Version response
-          _parseVersionResponse(data);
+        case 0xB1:
+          _parseImpedance(packet);
+          break;
+        case 0xD2:
+          _parseD2(packet);
           break;
         default:
-          _addLog('Unknown response command: 0x${command.toRadixString(16)}');
+          _addLog("Unknown command: 0x${cmd.toRadixString(16)}");
       }
     }
   }
 
-  void _parseImpedanceModeResponse(Uint8List data) {
-    if (data.length < 5) return;
-
-    int result = data[3];
-    String resultText = '';
-    switch (result) {
-      case 0x00:
-        resultText = 'Switch OK';
-        break;
-      case 0x01:
-        resultText = 'Working mode error';
-        break;
-      case 0x02:
-        resultText = 'Frequency error';
-        break;
-      default:
-        resultText = 'Unknown result';
+  bool _verifyChecksum(Uint8List packet) {
+    if (packet.isEmpty) return false;
+    int sum = 0;
+    for (int i = 0; i < packet.length - 1; i++) {
+      sum = (sum + packet[i]) & 0xFF;
     }
-
-    _addLog('Impedance mode switch: $resultText');
+    int expectedChecksum = ((~sum) + 1) & 0xFF;
+    return packet[packet.length - 1] == expectedChecksum;
   }
 
-  void _parseImpedanceStatus(Uint8List data) {
-    if (data.length < 13) return; // Minimum length for four-electrode response
-
-    int measurementFreq = data[3];
-    int impedanceState = data[4];
-    int dataType = data[5];
-
-    setState(() {
-      _impedanceStatus = _getImpedanceStatusText(impedanceState);
-    });
-
-    if (impedanceState == 0x03 && data.length >= 13) {
-      // Measurement successful
-      // Parse four-electrode TwoArms impedance data
-      // For TwoArms mode, we get phase angle and impedance
-
-      // Phase angle (bytes 6-7, int16_t, magnified 10 times)
-      int phaseAngleRaw = (data[7] << 8) | data[6];
-      double phaseAngle = phaseAngleRaw / 10.0;
-
-      // Impedance (bytes 8-11, uint32_t, resolution 1Ω)
-      int impedanceRaw =
-          (data[11] << 24) | (data[10] << 16) | (data[9] << 8) | data[8];
-      double impedance = impedanceRaw.toDouble();
-
-      // For arms measurement, we'll store this as combined arms impedance
-      String freqKey = _getFrequencyString(measurementFreq);
-      if (freqKey.isNotEmpty) {
-        setState(() {
-          // Store the impedance value for both arms (since it's a combined measurement)
-          _impedanceData['rightHand$freqKey'] = impedance;
-          _impedanceData['leftHand$freqKey'] = impedance;
-        });
-
-        _addLog(
-          'Arms impedance ($freqKey): ${impedance.toStringAsFixed(1)}Ω, Phase: ${phaseAngle.toStringAsFixed(1)}°',
-        );
-      }
-    }
-  }
-
-  String _getFrequencyString(int freq) {
-    switch (freq) {
-      case 0x03:
-        return '20kHz';
-      case 0x05:
-        return '50kHz';
-      case 0x06:
-        return '100kHz';
-      default:
-        return '';
-    }
-  }
-
-  void _parseVersionResponse(Uint8List data) {
-    if (data.length >= 6) {
-      int app = data[3];
-      int version = (data[5] << 8) | data[4];
-      String appName = app == 0x00
-          ? 'Master'
-          : (app == 0x01 ? 'Bia' : 'Weight');
-      String versionString = 'v${(version >> 8)}.${version & 0xFF}';
-
-      setState(() {
-        _deviceVersion = '$appName: $versionString';
-      });
-
-      _addLog('Version - $appName: $versionString');
-    }
-  }
-
-  String _getImpedanceStatusText(int status) {
-    switch (status) {
-      case 0x00:
-        return 'NULL';
-      case 0x01:
-        return 'Checking Electrodes';
-      case 0x02:
-        return 'Measuring';
-      case 0x03:
-        return 'Success';
-      case 0x04:
-        return 'Range Error';
-      case 0x05:
-        return 'Repeat Error';
-      case 0x06:
-        return 'User Exit';
-      default:
-        return 'Unknown';
-    }
-  }
-
-  void _getDeviceVersion() {
-    // Get Master version: 55 05 E0 00 C6
-    Uint8List command = Uint8List.fromList([0x55, 0x05, 0xE0, 0x00, 0xC6]);
-    _sendCommand(command, 'Get Version');
-  }
-
-  void _startArmsImpedanceMeasurement() {
-    // Four-electrode TwoArms 50kHz measurement: 55 06 B0 03 05 ED
-    Uint8List command = Uint8List.fromList([
-      0x55,
-      0x06,
-      0xB0,
-      0x03,
-      0x05,
-      0xED,
-    ]);
-    _sendCommand(command, 'Start Arms Impedance Measurement (50kHz)');
-
-    setState(() {
-      _isMeasuring = true;
-    });
-
-    // Start periodic impedance status requests
-    _measurementTimer = Timer.periodic(Duration(seconds: 1), (timer) {
-      if (_isConnected && _isMeasuring) {
-        _requestArmsImpedanceStatus();
-      }
-    });
-  }
-
-  void _requestArmsImpedanceStatus() {
-    // Request 50kHz raw impedance for TwoArms: 55 05 B1 51 A4
-    Uint8List command = Uint8List.fromList([0x55, 0x05, 0xB1, 0x51, 0xA4]);
-    _sendCommand(command, 'Request Arms Impedance Status');
-  }
-
-  void _stopImpedanceMeasurement() {
-    // Stop current test: 55 06 B0 00 00 F5
-    Uint8List command = Uint8List.fromList([
-      0x55,
-      0x06,
-      0xB0,
-      0x00,
-      0x00,
-      0xF5,
-    ]);
-    _sendCommand(command, 'Stop Impedance Measurement');
-
-    _measurementTimer?.cancel();
-    setState(() {
-      _isMeasuring = false;
-    });
-  }
-
-  void _testBodyCompositionAlgorithm() {
-    // Test with sample data for TwoArms algorithm (0xD2)
-    // Gender: Male(1), UserType: Normal(0), Height: 172cm, Age: 23, Weight: 62.3kg, Arms impedance: 758Ω
-    List<int> command = [
-      0x55, 0x0C, 0xD2, // Header, length, command
-      0x01, // Gender (Male)
-      0x00, // User type (Normal)
-      0xAC, // Height (172cm)
-      0x17, // Age (23)
-      0x6F, 0x02, // Weight (623 = 62.3kg)
-      0xF6, 0x02, // Arms impedance (758Ω)
-    ];
-
-    // Calculate checksum
-    int checksum = 0;
-    for (int i = 0; i < command.length; i++) {
-      checksum += command[i];
-    }
-    checksum = (~checksum + 1) & 0xFF;
-    command.add(checksum);
-
-    _sendCommand(
-      Uint8List.fromList(command),
-      'Test Body Composition Algorithm',
-    );
-  }
-
-  Future<void> _sendCommand(Uint8List command, String description) async {
-    if (!_isConnected) {
-      _addLog('Device not connected');
+  void _parseVersion(Uint8List d) {
+    if (d.length < 7) {
+      _addLog("Version packet too short: ${d.length} bytes");
       return;
     }
 
-    try {
-      bool sent = await _serialCommunication.write(command);
-      if (sent) {
-        _addLog(
-          '$description sent: ${command.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}',
-        );
-      } else {
-        _addLog('Failed to send $description');
-      }
-    } catch (e) {
-      _addLog('Error sending $description: $e');
+    final appType = d[3];
+    final versionLow = d[4];
+    final versionHigh = d[5];
+
+    String appName;
+    switch (appType) {
+      case 0x00:
+        appName = "Master";
+        break;
+      case 0x01:
+        appName = "BIA";
+        break;
+      case 0x02:
+        appName = "Weight";
+        break;
+      default:
+        appName = "Unknown";
+    }
+
+    _addLog("Device version: $appName v$versionHigh.$versionLow");
+  }
+
+  void _parseModeSwitch(Uint8List d) {
+    if (d.length < 5) {
+      _addLog("Mode switch response too short");
+      return;
+    }
+
+    final result = d[3];
+    switch (result) {
+      case 0x00:
+        _addLog("Mode switch OK (mode=0x${_currentMode.toRadixString(16)})");
+        // Increased delay before querying impedance
+        Future.delayed(const Duration(milliseconds: 1000), () {
+          _impedanceRetries = 0;
+          _queryImpedance();
+        });
+        break;
+      case 0x01:
+        _addLog("Mode switch failed: Working mode error");
+        break;
+      case 0x02:
+        _addLog("Mode switch failed: Frequency error");
+        break;
+      default:
+        _addLog("Mode switch failed: Unknown error $result");
     }
   }
 
-  void _addLog(String message) {
-    setState(() {
-      String timestamp = DateTime.now().toString().substring(11, 19);
-      _log += '$timestamp: $message\n';
-    });
-    print(message);
+  void _queryImpedance() {
+    _send([0x55, 0x05, 0xB1, 0x51, 0xA4], "Query 50kHz impedance");
   }
 
-  void _clearLog() {
-    setState(() {
-      _log = '';
-    });
+  void _parseImpedance(Uint8List d) {
+    if (d.length < 13) {
+      _addLog("Impedance packet too short: ${d.length} bytes");
+      return;
+    }
+
+    final frequency = d[3];
+    final state = d[4];
+
+    if (state != 0x03) {
+      String stateStr;
+      switch (state) {
+        case 0x01:
+          stateStr = "Checking electrode";
+          break;
+        case 0x02:
+          stateStr = "Measuring";
+          break;
+        case 0x04:
+          stateStr = "Error - abnormal data";
+          break;
+        case 0x05:
+          stateStr = "Error - repeated abnormalities";
+          break;
+        case 0x06:
+          stateStr = "User exited";
+          break;
+        default:
+          stateStr = "Unknown ($state)";
+      }
+
+      _addLog("Impedance state: $stateStr");
+
+      // Automatic retry logic
+      if (state == 0x01 && _impedanceRetries < 3) {
+        _impedanceRetries++;
+        _addLog("Retrying impedance (#$_impedanceRetries) in 1s...");
+        Future.delayed(const Duration(seconds: 1), _queryImpedance);
+        return;
+      }
+
+      // After retries, try switching to other mode
+      if (state == 0x01 && !_autoSwitchTried) {
+        _autoSwitchTried = true;
+        _addLog("Switching to FourElectrode mode (0x02)...");
+        _switchMode(0x02);
+        return;
+      }
+
+      return;
+    }
+
+    // Parsing impedance value (bytes 8–11)
+    final imp = d[8] | (d[9] << 8) | (d[10] << 16) | (d[11] << 24);
+    if (imp > 0 && imp < 1200) {
+      setState(() => _impedance = imp.toDouble());
+      _addLog("Two-arms impedance (50kHz): $_impedance Ω");
+    } else {
+      _addLog("Invalid impedance value: $imp Ω");
+    }
+  }
+
+  void _switchMode(int mode) {
+    _currentMode = mode;
+    _impedanceRetries = 0;
+    int sum = (0x55 + 0x06 + 0xB0 + mode + 0x05) & 0xFF;
+    int chk = ((~sum) + 1) & 0xFF;
+    _send([
+      0x55,
+      0x06,
+      0xB0,
+      mode,
+      0x05,
+      chk,
+    ], "Switch to mode=0x${mode.toRadixString(16)} 50kHz");
+  }
+
+  // void _startImpedance() {
+  //   _addLog("==== Starting impedance measurement ====");
+  //   // Switch to TwoArms (0x03) mode, 50kHz (0x05)
+  //   // _send([0x55, 0x06, 0xB0, 0x03, 0x05, 0xED], "Switch to TwoArms 50kHz mode");
+  //   _send([
+  //     0x55,
+  //     0x06,
+  //     0xB0,
+  //     0x02,
+  //     0x05,
+  //     0xEE,
+  //   ], "Switch to FourElectrode 50kHz mode");
+  // }
+  void _startImpedance() {
+    _addLog("==== Starting impedance measurement ====");
+    _autoSwitchTried = false;
+    _switchMode(0x03); // start with TwoArms
+  }
+
+  Future<void> _sendSelfTest() async {
+    final List<Map<String, List<int>>> tests = [
+      {
+        "Master self-test": [0x55, 0x05, 0xB3, 0x00, 0xF3],
+      },
+      {
+        "BIA self-test": [0x55, 0x05, 0xB3, 0x01, 0xF2],
+      },
+      {
+        "Weight self-test": [0x55, 0x05, 0xB3, 0x02, 0xF1],
+      },
+    ];
+
+    bool gotResponse = false;
+
+    for (final test in tests) {
+      final desc = test.keys.first;
+      final cmd = test.values.first;
+
+      _addLog("Sending $desc...");
+      final sent = await _serial.write(Uint8List.fromList(cmd));
+      if (sent) {
+        _addLog(
+          "Sent $desc: ${cmd.map((e) => e.toRadixString(16).padLeft(2, '0')).join(' ').toUpperCase()}",
+        );
+      } else {
+        _addLog("Failed to send $desc");
+      }
+
+      // Wait up to 1 second for any response
+      final completer = Completer<void>();
+      late StreamSubscription sub;
+      sub = _serial.getSerialMessageListener().receiveBroadcastStream().listen((
+        data,
+      ) {
+        if (data is Uint8List && data.isNotEmpty && data[2] == 0xB3) {
+          gotResponse = true;
+          _addLog(
+            "Self-test response received: ${data.map((e) => e.toRadixString(16).padLeft(2, '0')).join(' ').toUpperCase()}",
+          );
+          sub.cancel();
+          completer.complete();
+        }
+      });
+
+      await Future.any([
+        completer.future,
+        Future.delayed(const Duration(seconds: 2)),
+      ]);
+      await sub.cancel();
+    }
+
+    if (!gotResponse) {
+      _addLog(
+        "⚠️ No B3 responses detected. This firmware (Master v1.5) likely does not support self-test command.",
+      );
+    } else {
+      _addLog("✅ Self-test command supported and responded successfully.");
+    }
+  }
+
+  void _calculate() {
+    if (_impedance == null) {
+      _addLog("No impedance measurement yet. Please measure first.");
+      return;
+    }
+
+    int heightCm = (_heightFeet * 30.48 + _heightInch * 2.54).round();
+    if (heightCm < 90 || heightCm > 220) {
+      _addLog("Height out of range: $heightCm cm (valid: 90-220)");
+      return;
+    }
+
+    if (_age < 6 || _age > 99) {
+      _addLog("Age out of range: $_age (valid: 6-99)");
+      return;
+    }
+
+    int weight10 = (_weightKg * 10).round();
+    if (weight10 < 100 || weight10 > 2000) {
+      _addLog("Weight out of range: $_weightKg kg (valid: 10-200)");
+      return;
+    }
+
+    int imp = _impedance!.round();
+    if (imp < 10 || imp > 1200) {
+      _addLog("Impedance out of range: $imp Ω (valid: 10-1200)");
+      return;
+    }
+
+    // FIXED: Correct checksum calculation
+    final payload = [
+      0x55, // Frame header
+      0x0C, // Frame length
+      0xD2, // Command (TwoArms algorithm)
+      _sex, // Gender: 0=female, 1=male
+      0x00, // User type: 0=normal, 1=athlete
+      heightCm, // Height in cm
+      _age, // Age in years
+      weight10 & 0xFF, // Weight low byte (0.1kg units)
+      (weight10 >> 8) & 0xFF, // Weight high byte
+      imp & 0xFF, // Impedance low byte (1Ω units)
+      (imp >> 8) & 0xFF, // Impedance high byte
+    ];
+
+    // Calculate checksum: ~(sum of all bytes) + 1
+    int sum = 0;
+    for (int b in payload) {
+      sum = (sum + b) & 0xFF;
+    }
+    int checksum = ((~sum) + 1) & 0xFF;
+    payload.add(checksum);
+
+    _addLog(
+      "Calculating with: H=$heightCm cm, A=$_age y, W=$_weightKg kg, Z=$imp Ω",
+    );
+    _send(payload, "D2 Algorithm input");
+  }
+
+  void _parseD2(Uint8List d) {
+    if (d.length < 86) {
+      _addLog("D2 packet incomplete: ${d.length} bytes (expected 86)");
+      return;
+    }
+
+    final packetNum = d[3];
+    final errorType = d[4];
+
+    if (errorType != 0x00) {
+      String errorMsg;
+      switch (errorType) {
+        case 0x01:
+          errorMsg = "Wrong age";
+          break;
+        case 0x02:
+          errorMsg = "Wrong height";
+          break;
+        case 0x03:
+          errorMsg = "Wrong weight";
+          break;
+        case 0x04:
+          errorMsg = "Wrong gender";
+          break;
+        case 0x05:
+          errorMsg = "User type error";
+          break;
+        case 0x07:
+          errorMsg = "Hand impedance error";
+          break;
+        default:
+          errorMsg = "Unknown error ($errorType)";
+      }
+      _addLog("D2 calculation error: $errorMsg");
+      return;
+    }
+
+    _addLog(
+      "Parsing D2 response (packet ${packetNum & 0x0F}/${(packetNum >> 4)})",
+    );
+
+    Map<String, dynamic> r = {};
+
+    // Helper functions for little-endian parsing
+    int u16(int i) => d[i] | (d[i + 1] << 8);
+    int u8(int i) => d[i];
+
+    try {
+      // FIXED: Correct byte indices according to protocol document page 24-26
+      r["Fat mass (kg)"] = u16(5) / 10.0; // Bytes 5-6
+      r["Fat %"] = u16(7) / 10.0; // Bytes 7-8
+      r["Fat % (min)"] = u8(9) / 10.0; // Byte 9
+      r["Fat % (standard 1)"] = u16(10) / 10.0; // Bytes 10-11
+      r["Fat % (standard 2)"] = u16(12) / 10.0; // Bytes 12-13
+      r["Fat % (standard 3)"] = u16(14) / 10.0; // Bytes 14-15
+      r["BMI"] = u16(16) / 10.0; // Bytes 16-17
+      r["BMI (min)"] = u8(18) / 10.0; // Byte 18
+      r["BMI (max 1)"] = u8(19) / 10.0; // Byte 19
+      r["BMI (max 2)"] = u16(20) / 10.0; // Bytes 20-21
+      r["BMR (kcal)"] = u16(22); // Bytes 22-23
+      r["BMR min (kcal)"] = u16(24); // Bytes 24-25
+      r["Physical age"] = u8(26); // Byte 26
+      r["Lean mass (kg)"] = u16(27) / 10.0; // Bytes 27-28
+      r["Subcutaneous fat mass (kg)"] = u16(29) / 10.0; // Bytes 29-30
+      r["Subcutaneous fat %"] = u16(31) / 10.0; // Bytes 31-32
+      r["Subcutaneous fat % (min)"] = u8(33) / 10.0; // Byte 33
+      r["Subcutaneous fat % (max)"] = u16(34) / 10.0; // Bytes 34-35
+      r["Body score"] = u8(36); // Byte 36
+      r["Body type"] = _getBodyTypeName(u8(37)); // Byte 37
+      r["Bone mass (kg)"] = u8(38) / 10.0; // Byte 38
+      r["Bone mass min (kg)"] = u8(39) / 10.0; // Byte 39
+      r["Bone mass max (kg)"] = u8(40) / 10.0; // Byte 40
+      r["Ideal weight (kg)"] = u16(41) / 10.0; // Bytes 41-42
+      r["Moisture %"] = u16(43) / 10.0; // Bytes 43-44
+      r["Moisture % (min)"] = u16(45) / 10.0; // Bytes 45-46
+      r["Moisture % (max)"] = u16(47) / 10.0; // Bytes 47-48
+      r["Visceral fat level"] = u8(49); // Byte 49
+      r["Visceral fat (min)"] = u8(50); // Byte 50
+      r["Visceral fat (max)"] = u8(51); // Byte 51
+      r["Skeletal muscle (kg)"] = u16(52) / 10.0; // Bytes 52-53
+      r["Skeletal muscle min (kg)"] = u8(54) / 10.0; // Byte 54
+      r["Skeletal muscle max (kg)"] = u16(55) / 10.0; // Bytes 55-56
+      r["Protein %"] = u16(57) / 10.0; // Bytes 57-58
+      r["Protein % (min)"] = u8(59) / 10.0; // Byte 59
+      r["Protein % (max)"] = u8(60) / 10.0; // Byte 60
+      r["Muscle %"] = u16(61) / 10.0; // Bytes 61-62
+      r["Muscle mass (kg)"] = u16(63) / 10.0; // Bytes 63-64
+      r["Muscle mass min (kg)"] = u16(65) / 10.0; // Bytes 65-66
+      r["Muscle mass max (kg)"] = u16(67) / 10.0; // Bytes 67-68
+
+      // Exercise expenditure (kCal/30min)
+      r["Walk"] = u16(69);
+      r["Golf"] = u16(71);
+      r["Croquet"] = u16(73);
+      r["Tennis/Cycling/Basketball"] = u16(75);
+      r["Squash/Taekwondo/Fencing"] = u16(77);
+      r["Climb mountains"] = u16(79);
+      r["Swimming/Aerobics/Jogging"] = u16(81);
+      r["Badminton/Table tennis"] = u16(83);
+    } catch (e) {
+      _addLog("Parse error: $e");
+    }
+
+    setState(() => _results = r);
+    _addLog("Successfully parsed ${r.length} body composition parameters");
+  }
+
+  String _getBodyTypeName(int type) {
+    switch (type) {
+      case 0x01:
+        return "Thin";
+      case 0x02:
+        return "Thin muscular";
+      case 0x03:
+        return "Muscular";
+      case 0x04:
+        return "Bloated obesity";
+      case 0x05:
+        return "Fat muscular";
+      case 0x06:
+        return "Muscular fat";
+      case 0x07:
+        return "Lack exercise";
+      case 0x08:
+        return "Standard";
+      case 0x09:
+        return "Standard muscle";
+      default:
+        return "Unknown ($type)";
+    }
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext ctx) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text('BMH05108 Arms Monitor'),
-        backgroundColor: Colors.blue[700],
-      ),
-      body: Padding(
-        padding: EdgeInsets.all(16.0),
+      appBar: AppBar(title: const Text("BMH05108 Body Composition")),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Connection Section
+            // Device connection section
             Card(
               child: Padding(
-                padding: EdgeInsets.all(16.0),
+                padding: const EdgeInsets.all(12),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      'Connection',
+                    const Text(
+                      "Device Connection",
                       style: TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    SizedBox(height: 10),
+                    const SizedBox(height: 8),
                     Row(
                       children: [
                         Expanded(
                           child: DropdownButton<DeviceInfo>(
-                            hint: Text('Select Device'),
-                            value: _selectedDevice,
-                            items: _availableDevices.map((device) {
-                              return DropdownMenuItem(
-                                value: device,
-                                child: Text(
-                                  '${device.deviceName} (${device.manufacturerName})',
-                                ),
-                              );
-                            }).toList(),
-                            onChanged: (value) {
-                              setState(() {
-                                _selectedDevice = value;
-                              });
-                            },
-                          ),
-                        ),
-                        SizedBox(width: 10),
-                        ElevatedButton(
-                          onPressed: _scanForDevices,
-                          child: Text('Scan'),
-                        ),
-                      ],
-                    ),
-                    SizedBox(height: 10),
-                    Row(
-                      children: [
-                        ElevatedButton(
-                          onPressed: _isConnected ? null : _connectToDevice,
-                          child: Text('Connect'),
-                        ),
-                        SizedBox(width: 10),
-                        ElevatedButton(
-                          onPressed: _isConnected ? _disconnectDevice : null,
-                          child: Text('Disconnect'),
-                        ),
-                        SizedBox(width: 10),
-                        Container(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: _isConnected ? Colors.green : Colors.red,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Text(
-                            _isConnected ? 'Connected' : 'Disconnected',
-                            style: TextStyle(color: Colors.white, fontSize: 12),
-                          ),
-                        ),
-                      ],
-                    ),
-                    if (_deviceVersion != 'Unknown')
-                      Padding(
-                        padding: EdgeInsets.only(top: 8),
-                        child: Text(
-                          'Device: $_deviceVersion',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey[600],
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-
-            // Control Buttons
-            Card(
-              child: Padding(
-                padding: EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Controls',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    SizedBox(height: 10),
-                    Wrap(
-                      spacing: 10,
-                      runSpacing: 10,
-                      children: [
-                        ElevatedButton(
-                          onPressed: _isConnected ? _getDeviceVersion : null,
-                          child: Text('Get Version'),
-                        ),
-                        ElevatedButton(
-                          onPressed: (_isConnected && !_isMeasuring)
-                              ? _startArmsImpedanceMeasurement
-                              : null,
-                          child: Text('Start Arms Measurement'),
-                        ),
-                        ElevatedButton(
-                          onPressed: (_isConnected && _isMeasuring)
-                              ? _stopImpedanceMeasurement
-                              : null,
-                          child: Text('Stop Measurement'),
-                        ),
-                        ElevatedButton(
-                          onPressed: _isConnected
-                              ? _testBodyCompositionAlgorithm
-                              : null,
-                          child: Text('Test Algorithm'),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // Data Display
-            Card(
-              child: Padding(
-                padding: EdgeInsets.all(16.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Arms Impedance Measurements',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    SizedBox(height: 10),
-
-                    Container(
-                      padding: EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey[300]!),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text(
-                                'Status: $_impedanceStatus',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.grey[600],
-                                ),
-                              ),
-                              if (_isMeasuring)
-                                Container(
-                                  padding: EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.orange,
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: Text(
-                                    'MEASURING',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 10,
+                            isExpanded: true,
+                            hint: const Text("Select Device"),
+                            value: _selected,
+                            items: _devices
+                                .map(
+                                  (e) => DropdownMenuItem(
+                                    value: e,
+                                    child: Text(
+                                      "${e.deviceName} (${e.manufacturerName})",
                                     ),
                                   ),
-                                ),
-                            ],
+                                )
+                                .toList(),
+                            onChanged: (v) => setState(() => _selected = v),
                           ),
-                          SizedBox(height: 12),
-                          Text(
-                            'Instructions:',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 14,
+                        ),
+                        const SizedBox(width: 8),
+                        ElevatedButton(
+                          onPressed: _scan,
+                          child: const Text("Scan"),
+                        ),
+                        const SizedBox(width: 8),
+                        ElevatedButton(
+                          onPressed: _connected ? null : _connect,
+                          child: Text(_connected ? "Connected" : "Connect"),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // User information section
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "User Information",
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            decoration: const InputDecoration(
+                              labelText: "Age (years)",
+                              border: OutlineInputBorder(),
                             ),
-                          ),
-                          Text(
-                            '• Hold both hand electrodes firmly',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.grey[700],
+                            keyboardType: TextInputType.number,
+                            controller: TextEditingController(
+                              text: _age.toString(),
                             ),
+                            onChanged: (v) => _age = int.tryParse(v) ?? 30,
                           ),
-                          Text(
-                            '• Keep arms extended and slightly away from body',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.grey[700],
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: TextField(
+                            decoration: const InputDecoration(
+                              labelText: "Weight (kg)",
+                              border: OutlineInputBorder(),
                             ),
-                          ),
-                          Text(
-                            '• Remain still during measurement',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.grey[700],
+                            keyboardType: TextInputType.number,
+                            controller: TextEditingController(
+                              text: _weightKg.toString(),
                             ),
+                            onChanged: (v) =>
+                                _weightKg = double.tryParse(v) ?? 70,
                           ),
-                          SizedBox(height: 12),
-                          GridView.count(
-                            shrinkWrap: true,
-                            physics: NeverScrollableScrollPhysics(),
-                            crossAxisCount: 2,
-                            childAspectRatio: 2.5,
-                            crossAxisSpacing: 8,
-                            mainAxisSpacing: 8,
-                            children: [
-                              _buildImpedanceCard(
-                                'Right Hand',
-                                '20kHz',
-                                _impedanceData['rightHand20kHz'] ?? 0.0,
-                              ),
-                              _buildImpedanceCard(
-                                'Left Hand',
-                                '20kHz',
-                                _impedanceData['leftHand20kHz'] ?? 0.0,
-                              ),
-                              _buildImpedanceCard(
-                                'Right Hand',
-                                '50kHz',
-                                _impedanceData['rightHand50kHz'] ?? 0.0,
-                              ),
-                              _buildImpedanceCard(
-                                'Left Hand',
-                                '50kHz',
-                                _impedanceData['leftHand50kHz'] ?? 0.0,
-                              ),
-                            ],
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            decoration: const InputDecoration(
+                              labelText: "Height (feet)",
+                              border: OutlineInputBorder(),
+                            ),
+                            keyboardType: TextInputType.number,
+                            controller: TextEditingController(
+                              text: _heightFeet.toString(),
+                            ),
+                            onChanged: (v) =>
+                                _heightFeet = int.tryParse(v) ?? 5,
                           ),
-                        ],
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: TextField(
+                            decoration: const InputDecoration(
+                              labelText: "Height (inches)",
+                              border: OutlineInputBorder(),
+                            ),
+                            keyboardType: TextInputType.number,
+                            controller: TextEditingController(
+                              text: _heightInch.toString(),
+                            ),
+                            onChanged: (v) =>
+                                _heightInch = int.tryParse(v) ?? 7,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Text("Sex: "),
+                        Radio(
+                          value: 1,
+                          groupValue: _sex,
+                          onChanged: (v) => setState(() => _sex = v as int),
+                        ),
+                        const Text("Male"),
+                        Radio(
+                          value: 0,
+                          groupValue: _sex,
+                          onChanged: (v) => setState(() => _sex = v as int),
+                        ),
+                        const Text("Female"),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // Measurement section
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "Measurement",
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    ElevatedButton.icon(
+                      onPressed: _connected ? _sendSelfTest : null,
+                      icon: const Icon(Icons.settings),
+                      label: const Text("Run Self-Test"),
+                      style: ElevatedButton.styleFrom(
+                        minimumSize: const Size(double.infinity, 48),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    ElevatedButton.icon(
+                      onPressed: _connected ? _startImpedance : null,
+                      icon: const Icon(Icons.electric_bolt),
+                      label: const Text("Measure Impedance"),
+                      style: ElevatedButton.styleFrom(
+                        minimumSize: const Size(double.infinity, 48),
+                      ),
+                    ),
+                    if (_impedance != null) ...[
+                      const SizedBox(height: 8),
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.green[50],
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.green),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.check_circle, color: Colors.green),
+                            const SizedBox(width: 8),
+                            Text(
+                              "Impedance: ${_impedance!.toStringAsFixed(1)} Ω",
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    ElevatedButton.icon(
+                      onPressed: (_impedance != null) ? _calculate : null,
+                      icon: const Icon(Icons.calculate),
+                      label: const Text("Calculate Body Composition"),
+                      style: ElevatedButton.styleFrom(
+                        minimumSize: const Size(double.infinity, 48),
                       ),
                     ),
                   ],
                 ),
               ),
             ),
+            const SizedBox(height: 12),
 
-            // Log Section
-            Expanded(
-              child: Card(
+            // Results section
+            if (_results.isNotEmpty)
+              Card(
                 child: Padding(
-                  padding: EdgeInsets.all(16.0),
+                  padding: const EdgeInsets.all(12),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(
-                            'Communication Log',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          ElevatedButton(
-                            onPressed: _clearLog,
-                            child: Text('Clear'),
-                          ),
-                        ],
-                      ),
-                      SizedBox(height: 10),
-                      Expanded(
-                        child: Container(
-                          padding: EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            border: Border.all(color: Colors.grey[300]!),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: SingleChildScrollView(
-                            reverse: true,
-                            child: Text(
-                              _log.isEmpty
-                                  ? 'No communication logs yet...'
-                                  : _log,
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontFamily: 'monospace',
-                              ),
-                            ),
-                          ),
+                      const Text(
+                        "Body Composition Results",
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
                         ),
+                      ),
+                      const Divider(),
+                      // 2 columns grid layout
+                      GridView.count(
+                        crossAxisCount: 2,
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        childAspectRatio:
+                            9.8, // Adjust spacing (higher = flatter)
+                        mainAxisSpacing: 6,
+                        crossAxisSpacing: 10,
+                        children: _results.entries.map((e) {
+                          _addLog("Result: ${e.key} = ${e.value}");
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 6,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.grey[50],
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(color: Colors.grey.shade300),
+                            ),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  e.key,
+                                  style: const TextStyle(
+                                    fontSize: 13,
+                                    color: Colors.black87,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  e.value is double
+                                      ? (e.value as double).toStringAsFixed(1)
+                                      : e.value.toString(),
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.blueAccent,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        }).toList(),
                       ),
                     ],
                   ),
                 ),
               ),
+
+            // Card(
+            //   child: Padding(
+            //     padding: const EdgeInsets.all(12),
+            //     child: Column(
+            //       crossAxisAlignment: CrossAxisAlignment.start,
+            //       children: [
+            //         const Text(
+            //           "Body Composition Results",
+            //           style: TextStyle(
+            //             fontSize: 18,
+            //             fontWeight: FontWeight.bold,
+            //           ),
+            //         ),
+            //         const Divider(),
+            //         ..._results.entries.map(
+            //           (e) => Padding(
+            //             padding: const EdgeInsets.symmetric(vertical: 4),
+            //             child: Row(
+            //               mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            //               children: [
+            //                 Expanded(
+            //                   child: Text(
+            //                     e.key,
+            //                     style: const TextStyle(fontSize: 14),
+            //                   ),
+            //                 ),
+            //                 Text(
+            //                   e.value is double
+            //                       ? (e.value as double).toStringAsFixed(1)
+            //                       : e.value.toString(),
+            //                   style: const TextStyle(
+            //                     fontSize: 14,
+            //                     fontWeight: FontWeight.bold,
+            //                   ),
+            //                 ),
+            //               ],
+            //             ),
+            //           ),
+            //         ),
+            //       ],
+            //     ),
+            //   ),
+            // ),
+            const SizedBox(height: 12),
+
+            // Log section
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          "Communication Log",
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => setState(() => _log = ""),
+                          child: const Text("Clear"),
+                        ),
+                      ],
+                    ),
+                    const Divider(),
+                    Container(
+                      constraints: const BoxConstraints(maxHeight: 300),
+                      child: SingleChildScrollView(
+                        child: Text(
+                          _log.isEmpty ? "No logs yet" : _log,
+                          style: const TextStyle(
+                            fontFamily: "monospace",
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildImpedanceCard(String label, String frequency, double value) {
-    return Container(
-      padding: EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: value > 0 ? Colors.blue[50] : Colors.grey[100],
-        border: Border.all(
-          color: value > 0 ? Colors.blue[200]! : Colors.grey[300]!,
-        ),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Text(
-            label,
-            style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
-          ),
-          Text(
-            frequency,
-            style: TextStyle(fontSize: 9, color: Colors.grey[600]),
-          ),
-          Text(
-            '${value.toStringAsFixed(1)}Ω',
-            style: TextStyle(
-              fontSize: 12,
-              color: value > 0 ? Colors.blue[800] : Colors.grey[600],
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
       ),
     );
   }
