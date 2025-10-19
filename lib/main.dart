@@ -19,7 +19,13 @@ class MyApp extends StatelessWidget {
   }
 }
 
+// working code of body composition using BMH05108 (Master v1.5 firmware)
+// Reference: BMH05108 protocol document v1.3 (page 20-26
 
+// 50kHz TwoArms mode)
+// FIXED: Corrected checksum calculation in _calculate()
+// FIXED: Corrected byte indices in _parseD2()
+// FIXED: Added delay after mode switch before querying impedance
 
 class BodyCompositionScreen extends StatefulWidget {
   const BodyCompositionScreen({super.key});
